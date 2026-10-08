@@ -181,9 +181,15 @@ do_mount() {
     # Silicon): libguestfs's appliance needs this to fall back to QEMU's
     # software (TCG) emulation on aarch64. See README.md "Known limitations".
     echo "starting guestmount (this can take a while without /dev/kvm)..."
+    # -o default_permissions routes FUSE permission checks through the kernel's
+    # normal generic_permission(), which honours root's CAP_DAC_OVERRIDE.
+    # Without it, guestmount's own partial check on chdir(2) denies access
+    # based on the guest's raw UID/GID bits even when running as root here
+    # (confirmed: plain reads/ls still worked, only chdir was affected) --
+    # those guest UIDs don't correspond to anything meaningful on the host.
     if ! LIBGUESTFS_BACKEND_SETTINGS=force_tcg guestmount \
         --format=raw -a "nbd://?socket=$sock" \
-        -i --ro \
+        -i --ro -o default_permissions \
         "$mountdir"; then
         echo "error: guestmount failed" >&2
         exit 1

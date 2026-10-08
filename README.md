@@ -147,6 +147,16 @@ Unmounts, stops `nbdkit`, and removes its socket/state directory
   VM config); it cannot tell you whether a given disk is ext4, NTFS, uses
   LVM, etc., since that requires reading guest data — which is exactly what
   `guestmount -i`'s auto-inspection does.
+- **Guest file ownership/permissions are preserved as-is.** A file owned by
+  UID 1000 inside the guest is still reported as UID 1000 under the mount —
+  these guest UIDs don't correspond to anything on the host. `-o
+  default_permissions` is passed to `guestmount` so the container's root
+  (which has `CAP_DAC_OVERRIDE`) can still read/traverse everything
+  regardless; without that flag, `chdir(2)` into a guest directory your
+  (host) UID doesn't own is denied even as root, while plain file reads and
+  `ls` oddly still work — an inconsistency in how libguestfs/FUSE partially
+  enforce permissions without `default_permissions`. A non-root user inside
+  the container would still be bound by the guest's real permission bits.
 - **nbdkit Go plugins can't daemonize** (an nbdkit-golang-plugin constraint,
   not ours); `mount-vma-disk-via-nbdkit.sh` runs `nbdkit -f` and backgrounds
   it itself, tracking the PID for `--umount`.
