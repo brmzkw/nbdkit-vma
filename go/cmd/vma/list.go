@@ -1,11 +1,7 @@
-// Command vma-info prints the devices and config blobs contained in a VMA
-// file, reading only the fixed-size header (never scanning the extent
-// stream), so it runs instantly regardless of the file's size.
 package main
 
 import (
 	"encoding/json"
-	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -34,64 +30,12 @@ type jsonOutput struct {
 	Configs []jsonConfig `json:"configs"`
 }
 
-func main() {
-	jsonOut := flag.Bool("json", false, "print machine-readable JSON instead of a human table")
-	resolveDevice := flag.String("resolve-device", "", "print \"dev_id<TAB>size_bytes\" for the named device and exit "+
-		"(exit 1 and list available names on stderr if not found); for scripting, instead of parsing --json output")
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: %s [--json] <file.vma>\n", os.Args[0])
-	}
-	flag.Parse()
-	if flag.NArg() != 1 {
-		flag.Usage()
-		os.Exit(2)
-	}
-	path := flag.Arg(0)
-
-	f, err := os.Open(path)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
-	defer func() { _ = f.Close() }()
-
-	hdr, err := vma.ParseHeader(f)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
-
-	if *resolveDevice != "" {
-		os.Exit(runResolveDevice(hdr, *resolveDevice))
-	}
-
-	if *jsonOut {
-		printJSON(hdr)
-		return
-	}
-	printHuman(path, hdr)
-}
-
-func runResolveDevice(hdr *vma.Header, name string) int {
-	d, ok := hdr.DeviceByName(name)
-	if !ok {
-		fmt.Fprintf(os.Stderr, "error: no device named %q in this vma file\n", name)
-		fmt.Fprintln(os.Stderr, "available devices:")
-		for _, d := range hdr.Devices {
-			fmt.Fprintf(os.Stderr, "  %s (%s)\n", d.Name, humanSize(d.Size))
-		}
-		return 1
-	}
-	fmt.Printf("%d\t%d\n", d.ID, d.Size)
-	return 0
-}
-
 func printHuman(path string, hdr *vma.Header) {
 	fmt.Printf("%s\n", path)
 	fmt.Printf("  uuid:  %x\n", hdr.UUID)
 	fmt.Printf("  ctime: %s\n\n", time.Unix(int64(hdr.CtimeUnix), 0).UTC().Format(time.RFC3339))
 
-	fmt.Println("Devices (dev_id is the identifier to pass to mount-vma-disk.sh):")
+	fmt.Println("Devices (dev-name is the identifier to pass to -m):")
 	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "  DEV_ID\tNAME\tSIZE\tNOTE")
 	for _, d := range hdr.Devices {
@@ -121,7 +65,7 @@ func printHuman(path string, hdr *vma.Header) {
 
 	fmt.Println("\nNote: guest filesystem type/layout inside each disk (partition table, ext4 vs" +
 		" xfs vs LVM, etc.) is NOT determinable from the VMA header alone -- that requires reading" +
-		" guest data, which is exactly what mount-vma-disk.sh + guestmount do.")
+		" guest data, which is exactly what -m + guestmount do.")
 }
 
 func printJSON(hdr *vma.Header) {
