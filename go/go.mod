@@ -1,7 +1,7 @@
-module vma-nbd-poc
+module vma-fuse-poc
 
 go 1.22
 
-require libguestfs.org/nbdkit v0.0.0-00010101000000-000000000000
+require github.com/hanwen/go-fuse/v2 v2.11.1-0.20261008070459-7470faa92ea1
 
-replace libguestfs.org/nbdkit => ./third_party/nbdkit-golang
+require golang.org/x/sys v0.28.0 // indirect

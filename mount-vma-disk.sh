@@ -3,25 +3,27 @@
 # extracting it from the .vma file.
 #
 # How it works:
-#   1. nbdkit serves the selected device over a Unix-socket NBD export,
-#      using a Go plugin (go/cmd/nbdkit-vma-plugin) that decodes VMA clusters
-#      on demand straight out of the .vma file (see go/internal/vma).
-#   2. guestmount connects to that NBD export and mounts the guest
-#      filesystem it finds inside (auto-inspecting partitions/LVM/fs type).
+#   1. vma-fuse (go/cmd/vma-fuse) mounts a single virtual file, disk.raw,
+#      backed by the selected device's cluster index -- the same on-demand
+#      decoding logic used everywhere else in this repo (see
+#      go/internal/vma), now served through a small Go FUSE filesystem
+#      instead of a block-device protocol.
+#   2. guestmount opens that file directly (--format=raw) and mounts the
+#      guest filesystem it finds inside (auto-inspecting partitions/LVM/fs
+#      type).
 #
 # Only the bytes guestmount's filesystem probe and your subsequent reads
 # actually touch are ever read from the .vma file. Nothing is extracted.
 #
 # Usage:
-#   mount-vma-disk-via-nbdkit.sh <file.vma> <device-name> <mount-dir>
-#   mount-vma-disk-via-nbdkit.sh --umount <mount-dir>
+#   mount-vma-disk.sh <file.vma> <device-name> <mount-dir>
+#   mount-vma-disk.sh --umount <mount-dir>
 #
 # <device-name> is one of the names printed by list-vma-resources.sh (e.g.
 # "drive-scsi0").
 set -euo pipefail
 
-PLUGIN_SO=/usr/local/lib/nbdkit-vma-plugin.so
-STATE_ROOT=/run/vma-nbd-mounts
+STATE_ROOT=/run/vma-fuse-mounts
 
 usage() {
     cat >&2 <<EOF
@@ -32,9 +34,9 @@ EOF
     exit 2
 }
 
-# Derive a stable per-mount-dir state directory (nbdkit's pidfile + socket)
-# from the mount dir's absolute path, so a later --umount invocation (a
-# separate process) can find them again.
+# Derive a stable per-mount-dir state directory (vma-fuse's pidfile + its own
+# hidden FUSE mountpoint) from the mount dir's absolute path, so a later
+# --umount invocation (a separate process) can find them again.
 state_dir_for() {
     local mountdir_abs=$1
     local key
@@ -44,11 +46,10 @@ state_dir_for() {
 
 check_deps() {
     local missing=()
-    command -v nbdkit >/dev/null 2>&1 || missing+=("nbdkit")
+    command -v vma-fuse >/dev/null 2>&1 || missing+=("vma-fuse (built from go/cmd/vma-fuse)")
     command -v guestmount >/dev/null 2>&1 || missing+=("guestmount (libguestfs-tools)")
     command -v guestunmount >/dev/null 2>&1 || missing+=("guestunmount (libguestfs-tools)")
     command -v vma-info >/dev/null 2>&1 || missing+=("vma-info")
-    [[ -f "$PLUGIN_SO" ]] || missing+=("$PLUGIN_SO (nbdkit Go plugin, built from go/cmd/nbdkit-vma-plugin)")
 
     if ((${#missing[@]} > 0)); then
         echo "error: missing dependencies:" >&2
@@ -61,8 +62,8 @@ check_deps() {
         cat >&2 <<'EOF'
 error: /dev/fuse is not available in this container.
 
-guestmount needs FUSE to present the guest filesystem as a mountpoint. Run
-the container with:  --device /dev/fuse --cap-add SYS_ADMIN
+Both vma-fuse and guestmount need FUSE to present their mountpoints. Run the
+container with:  --device /dev/fuse --cap-add SYS_ADMIN
 (SYS_ADMIN is needed for the mount(2) syscall FUSE and guestmount's internal
 appliance perform; it is scoped to this one capability rather than
 --privileged -- see README.md for the full explanation.)
@@ -71,12 +72,21 @@ EOF
     fi
 }
 
+# unmount_fuse_dir unmounts vma-fuse's own hidden mountpoint, falling back to
+# a plain fusermount if it's no longer responding (e.g. we had to SIGKILL it).
+unmount_fuse_dir() {
+    local fuse_dir=$1
+    mountpoint -q "$fuse_dir" 2>/dev/null || return 0
+    fusermount3 -u "$fuse_dir" 2>/dev/null || fusermount -u "$fuse_dir" 2>/dev/null || true
+}
+
 do_umount() {
     local mountdir=$1
     local mountdir_abs
     mountdir_abs=$(readlink -f "$mountdir" 2>/dev/null || echo "$mountdir")
     local state_dir
     state_dir=$(state_dir_for "$mountdir_abs")
+    local fuse_dir="$state_dir/fuse"
 
     local had_error=0
 
@@ -90,17 +100,23 @@ do_umount() {
         echo "note: $mountdir is not currently mounted"
     fi
 
-    if [[ -f "$state_dir/nbdkit.pid" ]]; then
+    if [[ -f "$state_dir/vma-fuse.pid" ]]; then
         local pid
-        pid=$(cat "$state_dir/nbdkit.pid")
+        pid=$(cat "$state_dir/vma-fuse.pid")
         if kill -0 "$pid" 2>/dev/null; then
-            echo "stopping nbdkit (pid $pid)..."
+            # SIGTERM asks vma-fuse to unmount fuse_dir itself before
+            # exiting; only fall back to SIGKILL (and unmounting fuse_dir
+            # ourselves) if it doesn't respond.
+            echo "stopping vma-fuse (pid $pid)..."
             kill "$pid" 2>/dev/null || true
             for _ in $(seq 1 50); do
                 kill -0 "$pid" 2>/dev/null || break
                 sleep 0.1
             done
-            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -9 "$pid" 2>/dev/null || true
+                unmount_fuse_dir "$fuse_dir"
+            fi
         fi
     fi
 
@@ -135,45 +151,42 @@ do_mount() {
     size_bytes=${resolved##*$'\t'}
     echo "device '$device_name' (dev_id=$dev_id, $size_bytes bytes) found in $vma_file"
 
-    local mountdir_abs state_dir sock pidfile
+    local mountdir_abs state_dir fuse_dir pidfile
     mountdir_abs=$(readlink -f "$mountdir")
     state_dir=$(state_dir_for "$mountdir_abs")
-    sock="$state_dir/nbd.sock"
-    pidfile="$state_dir/nbdkit.pid"
+    fuse_dir="$state_dir/fuse"
+    pidfile="$state_dir/vma-fuse.pid"
 
-    mkdir -p "$state_dir"
-    rm -f "$sock"
+    mkdir -p "$fuse_dir"
 
     # Cleanup on any failure between here and the final success return; a
     # successful mount clears this trap before the script exits, because
-    # nbdkit must keep running in the background after we return.
-    local nbdkit_pid=""
+    # vma-fuse must keep running in the background after we return.
+    local vma_fuse_pid=""
     cleanup_on_failure() {
         echo "mount failed, cleaning up..." >&2
-        [[ -n "$nbdkit_pid" ]] && kill "$nbdkit_pid" 2>/dev/null || true
+        [[ -n "$vma_fuse_pid" ]] && kill "$vma_fuse_pid" 2>/dev/null || true
+        sleep 0.2
+        unmount_fuse_dir "$fuse_dir"
         rm -rf "$state_dir"
     }
     trap cleanup_on_failure EXIT
 
-    # nbdkit's golang plugin support can't daemonize (see
-    # nbdkit-golang-plugin(3)), so we run nbdkit in the foreground (-f) and
-    # background it ourselves. -r enforces read-only at the NBD level, on
-    # top of the plugin's own CanWrite=false.
-    echo "starting nbdkit..."
-    nbdkit -f -r -U "$sock" "$PLUGIN_SO" "vma=$vma_file" "device=$device_name" &
-    nbdkit_pid=$!
-    echo "$nbdkit_pid" > "$pidfile"
+    echo "starting vma-fuse..."
+    vma-fuse "$vma_file" "$device_name" "$fuse_dir" &
+    vma_fuse_pid=$!
+    echo "$vma_fuse_pid" > "$pidfile"
 
     for _ in $(seq 1 100); do
-        [[ -S "$sock" ]] && break
-        if ! kill -0 "$nbdkit_pid" 2>/dev/null; then
-            echo "error: nbdkit exited before creating its socket (see its output above)" >&2
+        [[ -e "$fuse_dir/disk.raw" ]] && break
+        if ! kill -0 "$vma_fuse_pid" 2>/dev/null; then
+            echo "error: vma-fuse exited before mounting its virtual file (see its output above)" >&2
             exit 1
         fi
         sleep 0.1
     done
-    if [[ ! -S "$sock" ]]; then
-        echo "error: timed out waiting for nbdkit's socket at $sock" >&2
+    if [[ ! -e "$fuse_dir/disk.raw" ]]; then
+        echo "error: timed out waiting for vma-fuse to mount $fuse_dir/disk.raw" >&2
         exit 1
     fi
 
@@ -188,7 +201,7 @@ do_mount() {
     # (confirmed: plain reads/ls still worked, only chdir was affected) --
     # those guest UIDs don't correspond to anything meaningful on the host.
     if ! LIBGUESTFS_BACKEND_SETTINGS=force_tcg guestmount \
-        --format=raw -a "nbd://?socket=$sock" \
+        --format=raw -a "$fuse_dir/disk.raw" \
         -i --ro -o default_permissions \
         "$mountdir"; then
         echo "error: guestmount failed" >&2

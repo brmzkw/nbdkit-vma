@@ -12,7 +12,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"vma-nbd-poc/internal/vma"
+	"vma-fuse-poc/internal/vma"
 )
 
 type jsonConfig struct {
@@ -91,7 +91,7 @@ func printHuman(path string, hdr *vma.Header) {
 	fmt.Printf("  uuid:  %x\n", hdr.UUID)
 	fmt.Printf("  ctime: %s\n\n", time.Unix(int64(hdr.CtimeUnix), 0).UTC().Format(time.RFC3339))
 
-	fmt.Println("Devices (dev_id is the identifier to pass to mount-vma-disk-via-nbdkit.sh):")
+	fmt.Println("Devices (dev_id is the identifier to pass to mount-vma-disk.sh):")
 	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "  DEV_ID\tNAME\tSIZE\tNOTE")
 	for _, d := range hdr.Devices {
@@ -121,7 +121,7 @@ func printHuman(path string, hdr *vma.Header) {
 
 	fmt.Println("\nNote: guest filesystem type/layout inside each disk (partition table, ext4 vs" +
 		" xfs vs LVM, etc.) is NOT determinable from the VMA header alone -- that requires reading" +
-		" guest data, which is exactly what mount-vma-disk-via-nbdkit.sh + guestmount do.")
+		" guest data, which is exactly what mount-vma-disk.sh + guestmount do.")
 }
 
 func printJSON(hdr *vma.Header) {

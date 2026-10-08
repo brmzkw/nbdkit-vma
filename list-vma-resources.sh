@@ -8,7 +8,7 @@
 #   list-vma-resources.sh [--json] <file.vma>
 #
 # The device names printed here (e.g. "drive-scsi0") are what you pass as
-# the disk identifier to mount-vma-disk-via-nbdkit.sh.
+# the disk identifier to mount-vma-disk.sh.
 set -euo pipefail
 
 usage() {
