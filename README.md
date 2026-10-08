@@ -24,18 +24,18 @@ Two Go programs are built from it at image build time:
 
 - **`vma-info`** (`go/cmd/vma-info`): parses just the header to list devices,
   sizes, and embedded config blobs. Used by `list-vma-resources.sh`.
-- **`nbdkit-vma-plugin.so`** (`go/cmd/nbdkit-vma-plugin`): an
-  [nbdkit](https://gitlab.com/nbdkit/nbdkit) Go plugin. On load it builds an
-  in-memory cluster index for one selected device (one scan of the extent
-  headers), then serves arbitrary byte-range reads against it by seeking
-  directly into the `.vma` file — decoding clusters on demand, never
-  extracting the disk. nbdkit has no plugin for VMA, so this plugin is itself
-  the "point critique" this POC had to resolve; it's novel as far as we found.
+- **`vma-fuse`** (`go/cmd/vma-fuse`): a [go-fuse](https://github.com/hanwen/go-fuse)
+  filesystem. On mount it builds an in-memory cluster index for one selected
+  device (one scan of the extent headers), then exposes that device as a
+  single virtual file, `disk.raw`, serving arbitrary byte-range reads against
+  it by seeking directly into the `.vma` file — decoding clusters on demand,
+  never extracting the disk.
 
-`mount-vma-disk-via-nbdkit.sh` starts `nbdkit` with that plugin, serving the
-selected device over a Unix-socket NBD export, then points `guestmount`
-(libguestfs) at it. `guestmount -i` auto-inspects the guest (partition table,
-LVM, filesystem type) and mounts the real root filesystem read-only.
+`mount-vma-disk.sh` starts `vma-fuse`, mounting the selected device as
+`disk.raw` under a hidden, per-mount directory, then points `guestmount`
+(libguestfs) straight at that file (`--format=raw`). `guestmount -i`
+auto-inspects the guest (partition table, LVM, filesystem type) and mounts
+the real root filesystem read-only.
 
 **What's read on demand vs. extracted: nothing is ever extracted.** The only
 non-trivial read ahead of time is the one-time cluster-index scan (header
@@ -47,15 +47,16 @@ mounted directory, ask for it.
 ### Anatomy of a single `ls`
 
 Running `ls` inside the mountpoint crosses two separate "machines" (the host
-container and a small inner VM) and two Unix sockets before a single byte of
-the `.vma` file is actually touched:
+container and a small inner VM) and two independent FUSE mounts before a
+single byte of the `.vma` file is actually touched:
 
 ```
 ls (your shell, in the container)
   │ getdents64()/statx() syscalls against a path under /mnt/<mountpoint>
   ▼
 Linux VFS → kernel FUSE module → /dev/fuse
-  │ (this is what makes the mountpoint "a filesystem" at all)
+  │ (this is guestmount's own FUSE connection, the thing that makes the
+  │ mountpoint "a filesystem" at all)
   ▼
 guestmount (control process, running in the container)
   │ translates the FUSE READDIR/GETATTR request into libguestfs API calls,
@@ -71,18 +72,20 @@ kernel + its own QEMU process, booted by guestmount; TCG-emulated here, no
   │ already have cached
   ▼
 appliance's own QEMU block layer: a local QCOW2 overlay file, whose backing
-file is the NBD Unix socket (confirmed via `qemu-img info` on a live mount:
-"backing file: nbd:unix:/run/vma-nbd-mounts/.../nbd.sock") — reads not yet
-present in the overlay fall through to the backing NBD connection; any
-writes the appliance's own kernel does internally (e.g. journal replay,
-access-time updates) land in the overlay only, never in the backing file
+file is disk.raw (confirmed via `qemu-img info` on a live mount: "backing
+file: /run/vma-fuse-mounts/.../fuse/disk.raw") — reads not yet present in
+the overlay fall through to the backing file; any writes the appliance's
+own kernel does internally (e.g. journal replay, access-time updates) land
+in the overlay only, never in the backing file
   ▼
-Unix socket, NBD protocol (NBD_CMD_READ(offset, length))
+open()/pread() against disk.raw, a perfectly ordinary-looking regular file
+as far as QEMU's "file" block driver is concerned
   ▼
-nbdkit (in the container, outside the appliance)
-  │ parses the NBD request, dispatches to our plugin's callback
+Linux VFS → kernel FUSE module → /dev/fuse
+  │ a second, independent FUSE connection: vma-fuse's own mount, not
+  │ guestmount's
   ▼
-nbdkit-vma-plugin's PRead(buf, offset, length)
+vma-fuse (go/cmd/vma-fuse)
   │ offset / 65536 → cluster number → one array lookup in the in-memory
   │ ClusterIndex (built once, at mount time, from the extent-header scan)
   │
@@ -99,29 +102,28 @@ point where the request actually leaves the container and is served by the
 real file on the host
 ```
 
-...and the result travels back up the exact same chain: nbdkit → NBD reply
-→ appliance's block layer → guest filesystem driver → guestfsd → virtio-
-serial → guestmount → FUSE reply → kernel → `ls`'s syscall returns, and `ls`
-prints what it got.
+...and the result travels back up the exact same chain: vma-fuse → kernel
+FUSE reply → appliance's block layer → guest filesystem driver → guestfsd →
+virtio-serial → guestmount → kernel FUSE reply → `ls`'s syscall returns, and
+`ls` prints what it got.
 
 A few things worth knowing when reasoning about this:
 
 - **Two independent "brains", not one.** The appliance is the only thing
-  that understands ext4/NTFS/LVM/etc; our plugin and nbdkit know nothing
-  about guest filesystems, only about where VMA clusters live inside the
-  `.vma` file. The appliance is the filesystem logic, our plugin is just its
-  block-level data source.
+  that understands ext4/NTFS/LVM/etc; vma-fuse knows nothing about guest
+  filesystems, only about where VMA clusters live inside the `.vma` file.
+  The appliance is the filesystem logic, vma-fuse is just its block-level
+  data source.
 - **Plain `ls` vs `ls -l`/`-la`.** A bare `ls` mostly needs the directory's
   entries (one READDIR-shaped round trip through the whole chain above);
   `ls -l`/`-la` additionally issues a GETATTR (stat) per entry, each one a
   separate round trip, unless already cached (see below).
-- **Caching happens at layers our plugin has no part in**: the appliance's
-  own page cache (it's a real, if small, Linux kernel), and the kernel FUSE
-  attribute/entry cache on the host side (`--dir-cache-timeout`, 5s by
-  default in `guestmount`). Nothing is cached on nbdkit's or our plugin's
-  side — every `PRead` that isn't absorbed by one of those caches really
-  does run the cluster-index lookup above, but we never cache block
-  contents ourselves.
+- **Caching happens at layers vma-fuse has no part in**: the appliance's own
+  page cache (it's a real, if small, Linux kernel), and the kernel FUSE
+  attribute/entry cache on guestmount's side (`--dir-cache-timeout`, 5s by
+  default). Nothing is cached on vma-fuse's side — every `Read` that isn't
+  absorbed by one of those caches really does run the cluster-index lookup
+  above, but we never cache block contents ourselves.
 - **Metadata reads mostly hit the real-data path, not the zero-fill path.**
   The directories/inodes a filesystem driver actually walks for `ls` are, by
   definition, allocated data, so they're "present" clusters. The zero-fill
@@ -131,9 +133,8 @@ A few things worth knowing when reasoning about this:
 
 ## Host dependencies
 
-Docker. That's it — `nbdkit`, `guestmount`/`guestfish`, `qemu-nbd`-equivalent
-tooling, and anything Proxmox-specific all live inside the image, per the
-project's constraint.
+Docker. That's it — `guestmount`/`guestfish` and anything Proxmox-specific
+all live inside the image, per the project's constraint.
 
 ## Building and running
 
@@ -166,7 +167,7 @@ Instant regardless of file size — it only reads the fixed header.
 
 ```sh
 mkdir -p /mnt/vma-disk
-mount-vma-disk-via-nbdkit.sh /app/your-backup.vma drive-scsi0 /mnt/vma-disk
+mount-vma-disk.sh /app/your-backup.vma drive-scsi0 /mnt/vma-disk
 ```
 
 `drive-scsi0` is just an example device name — use whatever
@@ -177,24 +178,24 @@ different mount dir and device name to inspect another disk.
 ### Unmount
 
 ```sh
-mount-vma-disk-via-nbdkit.sh --umount /mnt/vma-disk
+mount-vma-disk.sh --umount /mnt/vma-disk
 ```
 
-Unmounts, stops `nbdkit`, and removes its socket/state directory
-(`/run/vma-nbd-mounts/<hash of the mount dir>` inside the container).
+Unmounts, stops `vma-fuse`, and removes its mountpoint/state directory
+(`/run/vma-fuse-mounts/<hash of the mount dir>` inside the container).
 
 ## Docker privileges, explained
 
-- **`--device /dev/fuse`**: `guestmount` presents the guest filesystem via
-  FUSE; without this device node, FUSE mounts are unavailable in the
-  container.
+- **`--device /dev/fuse`**: both `vma-fuse` and `guestmount` present their
+  mountpoints via FUSE (two independent mounts per disk — see "Anatomy of a
+  single `ls`"); without this device node, FUSE mounts are unavailable in
+  the container.
 - **`--cap-add SYS_ADMIN`**: `mount(2)` (which FUSE mounting goes through)
   requires this capability. We did not need `--privileged` or `/dev/nbd*` —
-  the NBD export in this design is a Unix socket consumed directly by
-  libguestfs/qemu's own NBD client, never the kernel's `/dev/nbd` block
-  device, so no block-device access or kernel NBD module is involved at all.
+  there is no NBD, block device, or kernel block-layer module involved at
+  all; guestmount's appliance opens `disk.raw` as a plain file.
 - **`--init`**: not strictly about guestmount, but needed for cleanliness —
-  without a real init as PID 1, a container has nothing to reap `nbdkit`
+  without a real init as PID 1, a container has nothing to reap `vma-fuse`
   once `--umount` kills it, leaving a zombie process entry for the life of
   the container. `docker run --init` (Docker's built-in `tini`) fixes this.
 
@@ -203,12 +204,12 @@ Unmounts, stops `nbdkit`, and removes its socket/state directory
 - **Read-only.** No write path exists or is planned for this POC.
 - **One disk mounted at a time** (per design decision — see conversation
   history). Mount a second disk by running the script again with a
-  different mount dir; each gets its own `nbdkit` process and socket.
+  different mount dir; each gets its own `vma-fuse` process and mountpoint.
 - **In-memory cluster index size** scales with the device's *nominal* virtual
   size, not its actual stored data — thin provisioning doesn't shrink it.
   Each cluster (64KB) costs one 16-byte `clusterEntry` (an `int64` file
   offset + a `uint16` presence mask, padded to 8-byte alignment), held in a
-  flat array for the life of the `nbdkit` process. Concretely: a 250GiB
+  flat array for the life of the `vma-fuse` process. Concretely: a 250GiB
   virtual disk costs ~62MiB of index (built in a few seconds), 1TB → 256MiB,
   4TB → 1GiB, 16TB → 4GiB. This is still far smaller than the disk itself and
   nothing is ever written to storage for it, but at multi-TB scale the memory
@@ -248,12 +249,20 @@ Unmounts, stops `nbdkit`, and removes its socket/state directory
   `ls` oddly still work — an inconsistency in how libguestfs/FUSE partially
   enforce permissions without `default_permissions`. A non-root user inside
   the container would still be bound by the guest's real permission bits.
-- **nbdkit Go plugins can't daemonize** (an nbdkit-golang-plugin constraint,
-  not ours); `mount-vma-disk-via-nbdkit.sh` runs `nbdkit -f` and backgrounds
-  it itself, tracking the PID for `--umount`.
-- The nbdkit Go SDK (`go/third_party/nbdkit-golang`) is vendored from the
-  exact nbdkit release (`v1.36.3`) that Ubuntu 24.04 ships, rather than
-  fetched as a module at build time — its cgo bridge must match the
-  `nbdkit-plugin.h` ABI of whatever `nbdkit-plugin-dev` installs. Bumping
-  the Ubuntu/nbdkit version in the `Dockerfile` means re-vendoring from the
-  matching tag (see `go/third_party/nbdkit-golang/VENDORED.md`).
+- **`vma-fuse` runs in the foreground**, like most FUSE servers;
+  `mount-vma-disk.sh` backgrounds it itself and tracks the PID for
+  `--umount`.
+- **go.mod pins an unreleased `go-fuse` commit, not a tagged release.**
+  QEMU's `file` block driver (what backs `guestmount -a disk.raw
+  --format=raw`) issues a real `statx(2)` syscall when opening the image,
+  which the FUSE kernel module forwards as `FUSE_STATX` — a request no
+  tagged `go-fuse` release (up to and including v2.11.0) answers, causing
+  the open to fail outright. Support landed on `go-fuse`'s main branch after
+  v2.11.0; until the next tag ships, `go.mod` points at that commit via a
+  pseudo-version instead. Revisit once `go-fuse` cuts a release past this.
+- **Unmounting retries against a brief EBUSY window.** Right after
+  `guestunmount` returns, the appliance's own backing QEMU process may still
+  be closing its file descriptor on `disk.raw`; an immediate unmount of
+  vma-fuse's own mountpoint can fail with EBUSY. `vma-fuse` retries its
+  unmount on SIGTERM/SIGINT until it succeeds, rather than leaving the
+  mountpoint stuck as "Transport endpoint is not connected".
