@@ -20,22 +20,26 @@ a full PVE install. Instead, `go/internal/vma` is a from-scratch VMA parser
 the reference C implementation and an independent Python reimplementation,
 [jancc/vma-extractor](https://github.com/jancc/vma-extractor)).
 
-Two Go programs are built from it at image build time:
+One Go binary, `vma` (`go/cmd/vma`), is built from it at image build time,
+with two mutually exclusive modes:
 
-- **`vma-info`** (`go/cmd/vma-info`): parses just the header to list devices,
-  sizes, and embedded config blobs. Used by `list-vma-resources.sh`.
-- **`vma-fuse`** (`go/cmd/vma-fuse`): a [go-fuse](https://github.com/hanwen/go-fuse)
-  filesystem. On mount it builds an in-memory cluster index for one selected
-  device (one scan of the extent headers), then exposes that device as a
-  single virtual file, `disk.raw`, serving arbitrary byte-range reads against
-  it by seeking directly into the `.vma` file — decoding clusters on demand,
-  never extracting the disk.
+- **`vma <file.vma> -l`**: parses just the header to list devices, sizes,
+  and embedded config blobs.
+- **`vma <file.vma> -m <device-name> -o <mountpoint>`**: mounts one device.
+  Internally (`go/internal/mount`), it builds an in-memory cluster index for
+  the selected device (one scan of the extent headers), then exposes that
+  device as a single virtual file, `disk.raw`, through its own private
+  [go-fuse](https://github.com/hanwen/go-fuse) filesystem — serving
+  arbitrary byte-range reads against it by seeking directly into the `.vma`
+  file, decoding clusters on demand, never extracting the disk — and points
+  `guestmount` (libguestfs) straight at that file (`--format=raw`).
+  `guestmount -i` auto-inspects the guest (partition table, LVM, filesystem
+  type) and mounts the real root filesystem read-only.
 
-`mount-vma-disk.sh` starts `vma-fuse`, mounting the selected device as
-`disk.raw` under a hidden, per-mount directory, then points `guestmount`
-(libguestfs) straight at that file (`--format=raw`). `guestmount -i`
-auto-inspects the guest (partition table, LVM, filesystem type) and mounts
-the real root filesystem read-only.
+`vma -m/-o` runs in the foreground and blocks until interrupted
+(Ctrl-C/SIGTERM): use another terminal (or `docker exec`) to browse the
+mounted directory, and stop the `vma` process when you're done, which
+unmounts everything it mounted before exiting.
 
 **What's read on demand vs. extracted: nothing is ever extracted.** The only
 non-trivial read ahead of time is the one-time cluster-index scan (header
@@ -73,7 +77,7 @@ kernel + its own QEMU process, booted by guestmount; TCG-emulated here, no
   ▼
 appliance's own QEMU block layer: a local QCOW2 overlay file, whose backing
 file is disk.raw (confirmed via `qemu-img info` on a live mount: "backing
-file: /run/vma-fuse-mounts/.../fuse/disk.raw") — reads not yet present in
+file: /tmp/vma-fuse-.../disk.raw") — reads not yet present in
 the overlay fall through to the backing file; any writes the appliance's
 own kernel does internally (e.g. journal replay, access-time updates) land
 in the overlay only, never in the backing file
@@ -82,10 +86,10 @@ open()/pread() against disk.raw, a perfectly ordinary-looking regular file
 as far as QEMU's "file" block driver is concerned
   ▼
 Linux VFS → kernel FUSE module → /dev/fuse
-  │ a second, independent FUSE connection: vma-fuse's own mount, not
+  │ a second, independent FUSE connection: vma's own hidden mount, not
   │ guestmount's
   ▼
-vma-fuse (go/cmd/vma-fuse)
+vma's own FUSE server (go/internal/mount)
   │ offset / 65536 → cluster number → one array lookup in the in-memory
   │ ClusterIndex (built once, at mount time, from the extent-header scan)
   │
@@ -102,28 +106,29 @@ point where the request actually leaves the container and is served by the
 real file on the host
 ```
 
-...and the result travels back up the exact same chain: vma-fuse → kernel
-FUSE reply → appliance's block layer → guest filesystem driver → guestfsd →
-virtio-serial → guestmount → kernel FUSE reply → `ls`'s syscall returns, and
-`ls` prints what it got.
+...and the result travels back up the exact same chain: vma's FUSE server →
+kernel FUSE reply → appliance's block layer → guest filesystem driver →
+guestfsd → virtio-serial → guestmount → kernel FUSE reply → `ls`'s syscall
+returns, and `ls` prints what it got.
 
 A few things worth knowing when reasoning about this:
 
 - **Two independent "brains", not one.** The appliance is the only thing
-  that understands ext4/NTFS/LVM/etc; vma-fuse knows nothing about guest
-  filesystems, only about where VMA clusters live inside the `.vma` file.
-  The appliance is the filesystem logic, vma-fuse is just its block-level
-  data source.
+  that understands ext4/NTFS/LVM/etc; vma's own FUSE server knows nothing
+  about guest filesystems, only about where VMA clusters live inside the
+  `.vma` file. The appliance is the filesystem logic, vma is just its
+  block-level data source.
 - **Plain `ls` vs `ls -l`/`-la`.** A bare `ls` mostly needs the directory's
   entries (one READDIR-shaped round trip through the whole chain above);
   `ls -l`/`-la` additionally issues a GETATTR (stat) per entry, each one a
   separate round trip, unless already cached (see below).
-- **Caching happens at layers vma-fuse has no part in**: the appliance's own
-  page cache (it's a real, if small, Linux kernel), and the kernel FUSE
-  attribute/entry cache on guestmount's side (`--dir-cache-timeout`, 5s by
-  default). Nothing is cached on vma-fuse's side — every `Read` that isn't
-  absorbed by one of those caches really does run the cluster-index lookup
-  above, but we never cache block contents ourselves.
+- **Caching happens at layers vma's FUSE server has no part in**: the
+  appliance's own page cache (it's a real, if small, Linux kernel), and the
+  kernel FUSE attribute/entry cache on guestmount's side
+  (`--dir-cache-timeout`, 5s by default). Nothing is cached on vma's side —
+  every `Read` that isn't absorbed by one of those caches really does run
+  the cluster-index lookup above, but we never cache block contents
+  ourselves.
 - **Metadata reads mostly hit the real-data path, not the zero-fill path.**
   The directories/inodes a filesystem driver actually walks for `ls` are, by
   definition, allocated data, so they're "present" clusters. The zero-fill
@@ -151,14 +156,14 @@ docker run --rm -ti --init -v .:/app --device /dev/fuse --cap-add SYS_ADMIN test
 
 This drops you into a long-lived container with this directory bind-mounted
 at `/app`. From there, or via `docker exec` from another terminal against a
-container started the same way (see `Makefile`), run the two scripts as many
-times as you like.
+container started the same way (see `Makefile`), run `vma` as many times as
+you like.
 
 ### List the disks in a `.vma` file
 
 ```sh
-list-vma-resources.sh /app/your-backup.vma
-list-vma-resources.sh --json /app/your-backup.vma   # machine-readable
+vma /app/your-backup.vma -l
+vma /app/your-backup.vma -l --json   # machine-readable
 ```
 
 Instant regardless of file size — it only reads the fixed header.
@@ -166,50 +171,49 @@ Instant regardless of file size — it only reads the fixed header.
 ### Mount a disk
 
 ```sh
-mkdir -p /mnt/vma-disk
-mount-vma-disk.sh /app/your-backup.vma drive-scsi0 /mnt/vma-disk
+vma /app/your-backup.vma -m drive-scsi0 -o /mnt/vma-disk
 ```
 
-`drive-scsi0` is just an example device name — use whatever
-`list-vma-resources.sh` prints for your file. Works for any `.vma` file and
-any of its devices. One disk at a time per invocation; run it again with a
-different mount dir and device name to inspect another disk.
+`drive-scsi0` is just an example device name — use whatever `vma -l` prints
+for your file. Works for any `.vma` file and any of its devices.
 
-### Unmount
-
-```sh
-mount-vma-disk.sh --umount /mnt/vma-disk
-```
-
-Unmounts, stops `vma-fuse`, and removes its mountpoint/state directory
-(`/run/vma-fuse-mounts/<hash of the mount dir>` inside the container).
+This blocks in the foreground: open another terminal (`docker exec -ti
+<container> bash`) to browse `/mnt/vma-disk`. There's no separate `-u`/umount
+flag — Ctrl-C (or SIGTERM) the `vma` process itself, which unmounts
+everything it mounted before exiting. Mounting a second disk at the same
+time just means running `vma` again, in another terminal, with a different
+device name and mount dir.
 
 ## Docker privileges, explained
 
-- **`--device /dev/fuse`**: both `vma-fuse` and `guestmount` present their
-  mountpoints via FUSE (two independent mounts per disk — see "Anatomy of a
-  single `ls`"); without this device node, FUSE mounts are unavailable in
-  the container.
+- **`--device /dev/fuse`**: both `vma`'s own FUSE server and `guestmount`
+  present their mountpoints via FUSE (two independent mounts per disk — see
+  "Anatomy of a single `ls`"); without this device node, FUSE mounts are
+  unavailable in the container.
 - **`--cap-add SYS_ADMIN`**: `mount(2)` (which FUSE mounting goes through)
   requires this capability. We did not need `--privileged` or `/dev/nbd*` —
   there is no NBD, block device, or kernel block-layer module involved at
   all; guestmount's appliance opens `disk.raw` as a plain file.
-- **`--init`**: not strictly about guestmount, but needed for cleanliness —
-  without a real init as PID 1, a container has nothing to reap `vma-fuse`
-  once `--umount` kills it, leaving a zombie process entry for the life of
-  the container. `docker run --init` (Docker's built-in `tini`) fixes this.
+- **`--init`**: needed for cleanliness — `vma -m/-o` runs `guestmount -f` as
+  its direct child and waits on it, but `guestmount` boots its own libguestfs
+  appliance (a nested QEMU process) internally; without a real init as PID 1,
+  a container has nothing to reap any of that if things exit uncleanly (e.g.
+  `vma` is killed with `SIGKILL`, which it can't catch). `docker run --init`
+  (Docker's built-in `tini`) fixes this.
 
 ## Known limitations
 
 - **Read-only.** No write path exists or is planned for this POC.
-- **One disk mounted at a time** (per design decision — see conversation
-  history). Mount a second disk by running the script again with a
-  different mount dir; each gets its own `vma-fuse` process and mountpoint.
+- **Each `vma -m/-o` invocation mounts one disk** and blocks in the
+  foreground for the life of that mount; mount several disks at once by
+  running `vma` again, in another terminal, with a different device name
+  and mount dir — each invocation is independent (its own FUSE server, own
+  `guestmount` child, own cleanup on exit), nothing is shared between them.
 - **In-memory cluster index size** scales with the device's *nominal* virtual
   size, not its actual stored data — thin provisioning doesn't shrink it.
   Each cluster (64KB) costs one 16-byte `clusterEntry` (an `int64` file
   offset + a `uint16` presence mask, padded to 8-byte alignment), held in a
-  flat array for the life of the `vma-fuse` process. Concretely: a 250GiB
+  flat array for the life of the mount. Concretely: a 250GiB
   virtual disk costs ~62MiB of index (built in a few seconds), 1TB → 256MiB,
   4TB → 1GiB, 16TB → 4GiB. This is still far smaller than the disk itself and
   nothing is ever written to storage for it, but at multi-TB scale the memory
@@ -234,11 +238,11 @@ Unmounts, stops `vma-fuse`, and removes its mountpoint/state directory
   writable layer. This is a one-time cost per container lifetime, unrelated
   to the size of any particular `.vma` file, and is not part of what gets
   read from the backup.
-- **Guest filesystem type/layout is only known once mounted.**
-  `list-vma-resources.sh` reports what's in the VMA header (devices, sizes,
-  VM config); it cannot tell you whether a given disk is ext4, NTFS, uses
-  LVM, etc., since that requires reading guest data — which is exactly what
-  `guestmount -i`'s auto-inspection does.
+- **Guest filesystem type/layout is only known once mounted.** `vma -l`
+  reports what's in the VMA header (devices, sizes, VM config); it cannot
+  tell you whether a given disk is ext4, NTFS, uses LVM, etc., since that
+  requires reading guest data — which is exactly what `guestmount -i`'s
+  auto-inspection does.
 - **Guest file ownership/permissions are preserved as-is.** A file owned by
   UID 1000 inside the guest is still reported as UID 1000 under the mount —
   these guest UIDs don't correspond to anything on the host. `-o
@@ -249,9 +253,6 @@ Unmounts, stops `vma-fuse`, and removes its mountpoint/state directory
   `ls` oddly still work — an inconsistency in how libguestfs/FUSE partially
   enforce permissions without `default_permissions`. A non-root user inside
   the container would still be bound by the guest's real permission bits.
-- **`vma-fuse` runs in the foreground**, like most FUSE servers;
-  `mount-vma-disk.sh` backgrounds it itself and tracks the PID for
-  `--umount`.
 - **go.mod pins an unreleased `go-fuse` commit, not a tagged release.**
   QEMU's `file` block driver (what backs `guestmount -a disk.raw
   --format=raw`) issues a real `statx(2)` syscall when opening the image,
@@ -263,6 +264,6 @@ Unmounts, stops `vma-fuse`, and removes its mountpoint/state directory
 - **Unmounting retries against a brief EBUSY window.** Right after
   `guestunmount` returns, the appliance's own backing QEMU process may still
   be closing its file descriptor on `disk.raw`; an immediate unmount of
-  vma-fuse's own mountpoint can fail with EBUSY. `vma-fuse` retries its
-  unmount on SIGTERM/SIGINT until it succeeds, rather than leaving the
-  mountpoint stuck as "Transport endpoint is not connected".
+  `vma`'s own hidden FUSE mount can fail with EBUSY. `vma` retries that
+  unmount (bounded to a few seconds) before giving up, rather than leaving
+  the mountpoint stuck as "Transport endpoint is not connected".
