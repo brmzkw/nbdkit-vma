@@ -119,12 +119,16 @@ Unmounts, stops `nbdkit`, and removes its socket/state directory
 - **One disk mounted at a time** (per design decision — see conversation
   history). Mount a second disk by running the script again with a
   different mount dir; each gets its own `nbdkit` process and socket.
-- **In-memory cluster index size** scales with the device's *nominal* size,
-  not its actual stored data (one small struct per 64KB cluster — e.g. a
-  250GiB disk is ~4M clusters, a few dozen MB of index, built in a few
-  seconds). A multi-TB thin-provisioned disk would have a proportionally
-  larger index; still far smaller than the disk itself, and nothing is
-  written to disk for it.
+- **In-memory cluster index size** scales with the device's *nominal* virtual
+  size, not its actual stored data — thin provisioning doesn't shrink it.
+  Each cluster (64KB) costs one 16-byte `clusterEntry` (an `int64` file
+  offset + a `uint16` presence mask, padded to 8-byte alignment), held in a
+  flat array for the life of the `nbdkit` process. Concretely: 1TB virtual
+  disk → 256MiB index, 4TB → 1GiB, 16TB → 4GiB. The 250GiB sample disk here
+  is ~62MiB, built in ~3.6s. This is still far smaller than the disk itself
+  and nothing is ever written to storage for it, but at multi-TB scale the
+  memory cost is real and the current design has no cap or on-disk/streaming
+  fallback — it's an eager, full, in-memory array sized up front.
 - **No `/dev/kvm` on Docker Desktop for Apple Silicon** (confirmed: the
   Linux VM backing it exposes no KVM device). `guestmount`'s internal
   libguestfs appliance falls back to QEMU's software (TCG) emulation via
