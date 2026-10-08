@@ -40,10 +40,94 @@ LVM, filesystem type) and mounts the real root filesystem read-only.
 **What's read on demand vs. extracted: nothing is ever extracted.** The only
 non-trivial read ahead of time is the one-time cluster-index scan (header
 metadata only, typically a few seconds even on a multi-gigabyte file — see
-Limitations). Every
-byte of actual disk content is read from the `.vma` file exactly when
-`guestmount`'s filesystem probe, or your own reads inside the mounted
-directory, ask for it.
+Limitations). Every byte of actual disk content is read from the `.vma` file
+exactly when `guestmount`'s filesystem probe, or your own reads inside the
+mounted directory, ask for it.
+
+### Anatomy of a single `ls`
+
+Running `ls` inside the mountpoint crosses two separate "machines" (the host
+container and a small inner VM) and two Unix sockets before a single byte of
+the `.vma` file is actually touched:
+
+```
+ls (your shell, in the container)
+  │ getdents64()/statx() syscalls against a path under /mnt/<mountpoint>
+  ▼
+Linux VFS → kernel FUSE module → /dev/fuse
+  │ (this is what makes the mountpoint "a filesystem" at all)
+  ▼
+guestmount (control process, running in the container)
+  │ translates the FUSE READDIR/GETATTR request into libguestfs API calls,
+  │ sent over a virtio-serial channel (confirmed in this container's own
+  │ qemu command line: "-device virtserialport,...guestfsd.sock")
+  ▼
+guestfsd (daemon inside the libguestfs "appliance" — a real small Linux
+kernel + its own QEMU process, booted by guestmount; TCG-emulated here, no
+/dev/kvm)
+  │ runs ordinary ext4/xfs/NTFS/... syscalls against the filesystem IT
+  │ mounted from the guest's virtual disk; the appliance's filesystem driver
+  │ issues a block read when it needs a directory/inode block it doesn't
+  │ already have cached
+  ▼
+appliance's own QEMU block layer: a local QCOW2 overlay file, whose backing
+file is the NBD Unix socket (confirmed via `qemu-img info` on a live mount:
+"backing file: nbd:unix:/run/vma-nbd-mounts/.../nbd.sock") — reads not yet
+present in the overlay fall through to the backing NBD connection; any
+writes the appliance's own kernel does internally (e.g. journal replay,
+access-time updates) land in the overlay only, never in the backing file
+  ▼
+Unix socket, NBD protocol (NBD_CMD_READ(offset, length))
+  ▼
+nbdkit (in the container, outside the appliance)
+  │ parses the NBD request, dispatches to our plugin's callback
+  ▼
+nbdkit-vma-plugin's PRead(buf, offset, length)
+  │ offset / 65536 → cluster number → one array lookup in the in-memory
+  │ ClusterIndex (built once, at mount time, from the extent-header scan)
+  │
+  ├─ cluster never seen in the stream (fully sparse) → synthesize zeroes,
+  │  no file I/O at all
+  │
+  └─ cluster present → for each 4K sub-block the read touches: present
+     (mask bit set) → pread() the real bytes at their exact byte offset in
+     the .vma file; absent (mask bit clear — a sparse write inside an
+     otherwise-present cluster) → zero-fill, again no file I/O
+  ▼
+a plain read() against the .vma file — a bind-mounted file, so this is the
+point where the request actually leaves the container and is served by the
+real file on the host
+```
+
+...and the result travels back up the exact same chain: nbdkit → NBD reply
+→ appliance's block layer → guest filesystem driver → guestfsd → virtio-
+serial → guestmount → FUSE reply → kernel → `ls`'s syscall returns, and `ls`
+prints what it got.
+
+A few things worth knowing when reasoning about this:
+
+- **Two independent "brains", not one.** The appliance is the only thing
+  that understands ext4/NTFS/LVM/etc; our plugin and nbdkit know nothing
+  about guest filesystems, only about where VMA clusters live inside the
+  `.vma` file. The appliance is the filesystem logic, our plugin is just its
+  block-level data source.
+- **Plain `ls` vs `ls -l`/`-la`.** A bare `ls` mostly needs the directory's
+  entries (one READDIR-shaped round trip through the whole chain above);
+  `ls -l`/`-la` additionally issues a GETATTR (stat) per entry, each one a
+  separate round trip, unless already cached (see below).
+- **Caching happens at layers our plugin has no part in**: the appliance's
+  own page cache (it's a real, if small, Linux kernel), and the kernel FUSE
+  attribute/entry cache on the host side (`--dir-cache-timeout`, 5s by
+  default in `guestmount`). Nothing is cached on nbdkit's or our plugin's
+  side — every `PRead` that isn't absorbed by one of those caches really
+  does run the cluster-index lookup above, but we never cache block
+  contents ourselves.
+- **Metadata reads mostly hit the real-data path, not the zero-fill path.**
+  The directories/inodes a filesystem driver actually walks for `ls` are, by
+  definition, allocated data, so they're "present" clusters. The zero-fill
+  path mostly matters for the much larger unallocated regions of a
+  thin-provisioned disk, which nothing touches unless something does a
+  full-disk scan.
 
 ## Host dependencies
 
