@@ -39,7 +39,8 @@ LVM, filesystem type) and mounts the real root filesystem read-only.
 
 **What's read on demand vs. extracted: nothing is ever extracted.** The only
 non-trivial read ahead of time is the one-time cluster-index scan (header
-metadata only, a few seconds even on an ~12GB file — see Limitations). Every
+metadata only, typically a few seconds even on a multi-gigabyte file — see
+Limitations). Every
 byte of actual disk content is read from the `.vma` file exactly when
 `guestmount`'s filesystem probe, or your own reads inside the mounted
 directory, ask for it.
@@ -84,10 +85,10 @@ mkdir -p /mnt/vma-disk
 mount-vma-disk-via-nbdkit.sh /app/your-backup.vma drive-scsi0 /mnt/vma-disk
 ```
 
-`drive-scsi0` is the device name from `list-vma-resources.sh`'s output — this
-works for any `.vma` file and any of its devices, not just the sample backup
-used to build this POC. One disk at a time per invocation; run it again with
-a different mount dir and device name to inspect another disk.
+`drive-scsi0` is just an example device name — use whatever
+`list-vma-resources.sh` prints for your file. Works for any `.vma` file and
+any of its devices. One disk at a time per invocation; run it again with a
+different mount dir and device name to inspect another disk.
 
 ### Unmount
 
@@ -123,11 +124,11 @@ Unmounts, stops `nbdkit`, and removes its socket/state directory
   size, not its actual stored data — thin provisioning doesn't shrink it.
   Each cluster (64KB) costs one 16-byte `clusterEntry` (an `int64` file
   offset + a `uint16` presence mask, padded to 8-byte alignment), held in a
-  flat array for the life of the `nbdkit` process. Concretely: 1TB virtual
-  disk → 256MiB index, 4TB → 1GiB, 16TB → 4GiB. The 250GiB sample disk here
-  is ~62MiB, built in ~3.6s. This is still far smaller than the disk itself
-  and nothing is ever written to storage for it, but at multi-TB scale the
-  memory cost is real and the current design has no cap or on-disk/streaming
+  flat array for the life of the `nbdkit` process. Concretely: a 250GiB
+  virtual disk costs ~62MiB of index (built in a few seconds), 1TB → 256MiB,
+  4TB → 1GiB, 16TB → 4GiB. This is still far smaller than the disk itself and
+  nothing is ever written to storage for it, but at multi-TB scale the memory
+  cost is real and the current design has no cap or on-disk/streaming
   fallback — it's an eager, full, in-memory array sized up front.
 - **No `/dev/kvm` on Docker Desktop for Apple Silicon** (confirmed: the
   Linux VM backing it exposes no KVM device). `guestmount`'s internal
@@ -136,10 +137,12 @@ Unmounts, stops `nbdkit`, and removes its socket/state directory
   workaround for a `gic-version=host` bug when KVM is absent). Since the
   appliance runs natively on aarch64 (matching the container, not the
   guest's original x86-64 architecture), this is same-architecture
-  emulation, not cross-arch — slower than KVM but not worst-case. Measured
-  on the 11.84GB sample file: ~40s per mount with a warm appliance cache.
-  On a host with `/dev/kvm` (e.g. a Linux machine, or `docker run
-  --device /dev/kvm`), this should be several times faster.
+  emulation, not cross-arch — slower than KVM but not worst-case. In testing,
+  a single mount took on the order of tens of seconds with a warm appliance
+  cache, regardless of the backed-up disk's actual size (this cost is
+  appliance boot time, not proportional to the `.vma` file). On a host with
+  `/dev/kvm` (e.g. a Linux machine, or `docker run --device /dev/kvm`), this
+  should be several times faster.
 - **First mount in a fresh container is slower**: libguestfs builds and
   caches a ~450MB "supermin appliance" (a minimal kernel+initrd it uses
   internally) on first use, under `/var/tmp/.guestfs-*` in the container's
